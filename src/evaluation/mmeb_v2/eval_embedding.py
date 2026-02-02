@@ -317,7 +317,7 @@ def main():
                         scores = model.compute_similarity(qry_tensor, cand_tensor)
                         # Get ranked indices (descending order)
                         _, ranked_indices = torch.sort(scores, dim=1, descending=True)
-                        ranked_indices = ranked_indices.cpu().numpy()
+                        ranked_indices = ranked_indices.cpu().float().numpy()
                     
                     del cand_tensor
                     torch.cuda.empty_cache()
@@ -350,7 +350,7 @@ def main():
                             # Compute single-row similarity [1, Nc]
                             sim_scores = model.compute_similarity(qry_vec.unsqueeze(0), cand_tensor).squeeze(0)
                             _, ranked_idx = torch.sort(sim_scores, descending=True)
-                            ranked_idx = ranked_idx.cpu().numpy()
+                            ranked_idx = ranked_idx.cpu().float().numpy()
 
                         rel_docids = gt_info["label_name"] if isinstance(gt_info["label_name"], list) else [gt_info["label_name"]]
                         rel_scores = gt_info.get("rel_scores", None)
