@@ -1,0 +1,9 @@
+UCF101:
+    dataset_parser: video_classification
+    dataset_name: UCF101
+    video_root: video-tasks/videos/video_cls/UCF101/UCF-101
+    frame_root: video-tasks/frames/video_cls/UCF101
+    num_sample_per_subset: None
+    max_frames_saved: 64
+    num_frames: 64
+    eval_type: global

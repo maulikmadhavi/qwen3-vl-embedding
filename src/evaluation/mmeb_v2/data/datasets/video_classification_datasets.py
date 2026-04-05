@@ -26,10 +26,16 @@ def data_prepare(batch_dict, **kwargs):
         instruction = instruction[:-1] + "."
 
     query_inputs, cand_inputs, dataset_infos = [], [], []
-    
-    for video_id, label in zip(batch_dict['video_id'], batch_dict['pos_text']):
+
+    # Use video_path from dataset if available, otherwise fall back to video_id + '.mp4'
+    video_paths = batch_dict.get('video_path', [None] * len(batch_dict['video_id']))
+
+    for video_id, label, vid_path in zip(batch_dict['video_id'], batch_dict['pos_text'], video_paths):
         # Process video and extract frames
-        video_path = os.path.join(video_root, video_id + '.mp4')
+        if vid_path:
+            video_path = os.path.join(video_root, vid_path)
+        else:
+            video_path = os.path.join(video_root, video_id + '.mp4')
         frame_dir = os.path.join(frame_root, video_id)
         if not os.path.exists(frame_dir):
             save_frames(video_path=video_path, frame_dir=frame_dir, max_frames_saved=max_frames_saved)

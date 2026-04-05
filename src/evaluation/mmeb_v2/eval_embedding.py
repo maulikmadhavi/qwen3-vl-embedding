@@ -7,6 +7,7 @@ import random
 import datetime
 import pickle
 import json
+import logging
 import numpy as np
 import torch.distributed as dist
 
@@ -17,11 +18,44 @@ from transformers import HfArgumentParser
 from datasets import concatenate_datasets
 from datasets.distributed import split_dataset_by_node
 from .arguments import ModelArguments, DataArguments, EvalArguments
-from .utils.basic_utils import print_rank, print_master
+from .utils.basic_utils import print_rank
 from .utils.eval_utils.metrics import RankingMetrics
 from .models import MMEBEmbeddingModel
 from .data.datasets.base_eval_dataset import AutoEvalPairDataset, generate_cand_dataset
 from .data.collator import MultimodalEvalDataCollator
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(output_path: str, rank: int = 0):
+    """Configure logging to both console and file."""
+    log_file = os.path.join(output_path, "eval.log")
+
+    # Clear existing handlers on root logger to avoid duplicates
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    formatter = logging.Formatter(
+        "[%(asctime)s] %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # Console handler — always show INFO+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # File handler — only on rank 0
+    if rank == 0:
+        os.makedirs(output_path, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        logger.info(f"Logging to file: {log_file}")
 
 def pad_dataset_to_divisible(dataset, world_size):
     num_samples = len(dataset)
@@ -110,15 +144,11 @@ def main():
         torch.cuda.set_device(local_rank)
     if "RANK" in os.environ and dist.is_available() and not dist.is_initialized():
         dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
-    
+
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    print_master("=== Distributed Setup Initialized ===")
-    print_master(f"Master Info -> ADDR: {os.environ.get('MASTER_ADDR')}, PORT: {os.environ.get('MASTER_PORT')}")
-    print_master(f"Global World Size: {world_size}")
-    print_rank(f"Process Identity -> Rank: {rank}, Local Rank: {local_rank} on {torch.cuda.get_device_name()}")
-
+    # Parse arguments early so we can set up logging with the output path
     parser = HfArgumentParser((ModelArguments, DataArguments, EvalArguments))
     model_args, data_args, eval_args = parser.parse_args_into_dataclasses()
     model_args: ModelArguments
@@ -126,45 +156,76 @@ def main():
     eval_args: EvalArguments
     os.makedirs(data_args.encode_output_path, exist_ok=True)
 
+    # Set up logging to console + file
+    setup_logging(data_args.encode_output_path, rank=rank)
+
+    logger.info("=" * 60)
+    logger.info("Qwen3-VL-Embedding Evaluation")
+    logger.info("=" * 60)
+    logger.info(f"Model:        {model_args.model_name_or_path}")
+    logger.info(f"Config:       {data_args.dataset_config}")
+    logger.info(f"Output:       {data_args.encode_output_path}")
+    logger.info(f"Data basedir: {data_args.data_basedir}")
+    logger.info(f"Batch size:   {eval_args.per_device_eval_batch_size}")
+    logger.info(f"Normalize:    {model_args.normalize}")
+    logger.info(f"Device:       {eval_args.device}")
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(local_rank)
+        gpu_mem = torch.cuda.get_device_properties(local_rank).total_memory / 1e9
+        logger.info(f"GPU:          {gpu_name} ({gpu_mem:.1f} GB)")
+    logger.info(f"World size:   {world_size}")
+    logger.info(f"Rank:         {rank}, Local rank: {local_rank}")
+    logger.info("-" * 60)
+
     # DDP-safe model loading
-    # Step 1: Only rank 0 downloads the model
+    t0 = time.time()
     if rank == 0:
-        print_master(f"[rank=0] Loading the model from: {model_args.model_name_or_path}...")
+        logger.info(f"Loading model: {model_args.model_name_or_path} ...")
         model = MMEBEmbeddingModel.load(
             model_name_or_path=model_args.model_name_or_path,
             normalize=model_args.normalize,
             instruction=model_args.instruction,
-            attn_implementation='flash_attention_2',
+            attn_implementation='sdpa',
             torch_dtype=torch.bfloat16,
         )
 
-    # Step 2: All processes wait until rank 0 finishes downloading
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    
-    # Step 3: Non-master processes load from local cache
+
     if rank != 0:
-        print_rank(f"Loading the model from cache...")
+        logger.info(f"[rank={rank}] Loading model from cache...")
         time.sleep(random.randint(2 * rank, 3 * rank))
         model = MMEBEmbeddingModel.load(
             model_name_or_path=model_args.model_name_or_path,
             normalize=model_args.normalize,
             instruction=model_args.instruction,
-            attn_implementation='flash_attention_2',
+            attn_implementation='sdpa',
             torch_dtype=torch.bfloat16,
         )
-    
+
     model.eval()
     model = model.to(eval_args.device, dtype=torch.bfloat16)
+    logger.info(f"Model loaded in {time.time() - t0:.1f}s")
+
     with open(data_args.dataset_config, 'r') as yaml_file:
         dataset_configs = yaml.safe_load(yaml_file)
+    logger.info(f"Datasets to evaluate: {list(dataset_configs.keys())}")
 
     # Main evaluation loop
     for dataset_idx, (dataset_name, task_config) in enumerate(dataset_configs.items()):
-        # 0. load dataset
+        dataset_t0 = time.time()
         if dist.is_initialized():
             dist.barrier()
-        print_master(f"--- Evaluating {dataset_name} ---")
+
+        logger.info("")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"[{dataset_idx + 1}/{len(dataset_configs)}] Evaluating: {dataset_name}")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"  parser:     {task_config.get('dataset_parser')}")
+        logger.info(f"  eval_type:  {task_config.get('eval_type', 'global')}")
+        logger.info(f"  num_frames: {task_config.get('num_frames')}")
+        logger.info(f"  video_root: {task_config.get('video_root')}")
+        logger.info(f"  frame_root: {task_config.get('frame_root')}")
 
         query_embed_path = os.path.join(data_args.encode_output_path, f"{dataset_name}_qry")
         cand_embed_path = os.path.join(data_args.encode_output_path, f"{dataset_name}_tgt")
@@ -174,18 +235,25 @@ def main():
         do_cand = not os.path.exists(cand_embed_path)
 
         if do_query or do_cand:
+            logger.info(f"  Cached embeddings: queries={'found' if not do_query else 'MISSING'}, "
+                        f"candidates={'found' if not do_cand else 'MISSING'}")
+
             if data_args.data_basedir is not None:
                 for key in ["image_root", "video_root", "frame_root", "clip_root", "data_path"]:
                     if task_config.get(key):
                         task_config[key] = os.path.join(data_args.data_basedir, task_config[key])
 
             try:
+                logger.info(f"  Loading dataset from HuggingFace...")
                 full_eval_qry_dataset, corpus = AutoEvalPairDataset.instantiate(
                     model_args=model_args, data_args=data_args, **task_config
                 )
                 full_eval_cand_dataset = generate_cand_dataset(full_eval_qry_dataset, corpus)
                 eval_qry_dataset, eval_cand_dataset = full_eval_qry_dataset, full_eval_cand_dataset
-                
+                logger.info(f"  Dataset loaded: {len(full_eval_qry_dataset)} queries, "
+                            f"{len(full_eval_cand_dataset)} candidates, "
+                            f"{len(corpus) if corpus else 0} corpus classes")
+
                 # Pad datasets to be divisible by world_size before splitting
                 if dist.is_initialized():
                     padded_qry_dataset, _ = pad_dataset_to_divisible(full_eval_qry_dataset, world_size)
@@ -195,23 +263,23 @@ def main():
                 else:
                     padded_qry_dataset, padded_cand_dataset = full_eval_qry_dataset, full_eval_cand_dataset
             except Exception as e:
-                print_master(f"Failed to load dataset {dataset_name}, skipping {dataset_name}")
-                import traceback
-                traceback.print_exc()
-                print_master(e)
+                logger.error(f"  Failed to load dataset {dataset_name}: {e}", exc_info=True)
                 raise e
+        else:
+            logger.info(f"  Cached embeddings: queries=found, candidates=found (skipping encoding)")
 
         # 1. Compute query embeddings
         if do_query:
-            print_master("Encoding queries...")
+            logger.info(f"  Encoding {len(full_eval_qry_dataset)} queries (batch_size={eval_args.per_device_eval_batch_size})...")
+            t_enc = time.time()
             eval_qry_collator = MultimodalEvalDataCollator(encode_side="qry")
             eval_qry_loader = DataLoader(
-                eval_qry_dataset, 
-                batch_size=eval_args.per_device_eval_batch_size, 
-                collate_fn=eval_qry_collator, 
+                eval_qry_dataset,
+                batch_size=eval_args.per_device_eval_batch_size,
+                collate_fn=eval_qry_collator,
                 num_workers=eval_args.dataloader_num_workers,
                 pin_memory=True,
-                shuffle=False  # Must disable shuffle for encoding
+                shuffle=False
             )
             query_embeds, gt_infos = encode_embeddings(
                 model=model,
@@ -222,29 +290,26 @@ def main():
             )
             if rank == 0:
                 os.makedirs(os.path.dirname(query_embed_path), exist_ok=True)
-
-                # Save embeddings
                 with open(query_embed_path, 'wb') as f:
                     pickle.dump(query_embeds, f)
-                    
-                # Save dataset info in JSONL format
                 with open(dataset_info_path, 'w', encoding='utf-8') as f:
                     for info in gt_infos:
                         f.write(json.dumps(info, ensure_ascii=False) + '\n')
-                        
-                print_master(f"Successfully saved {len(query_embeds)} query embeddings to {query_embed_path}")
+                logger.info(f"  Query encoding done: {len(query_embeds)} embeddings in {time.time() - t_enc:.1f}s "
+                            f"-> {query_embed_path}")
 
             if dist.is_initialized():
                 dist.barrier()
 
         # 2. Compute candidate embeddings
         if do_cand:
-            print_master("Encoding candidates...")
+            logger.info(f"  Encoding {len(full_eval_cand_dataset)} candidates...")
+            t_enc = time.time()
             eval_cand_collator = MultimodalEvalDataCollator(encode_side="cand")
             eval_cand_loader = DataLoader(
-                eval_cand_dataset, 
-                batch_size=eval_args.per_device_eval_batch_size, 
-                collate_fn=eval_cand_collator, 
+                eval_cand_dataset,
+                batch_size=eval_args.per_device_eval_batch_size,
+                collate_fn=eval_cand_collator,
                 num_workers=eval_args.dataloader_num_workers,
                 pin_memory=True,
                 shuffle=False
@@ -258,15 +323,13 @@ def main():
             )
             if rank == 0:
                 os.makedirs(os.path.dirname(cand_embed_path), exist_ok=True)
-
-                # Map embeddings to dictionary: {cand_id: embedding_vector}
-                # Enables fast lookup by ID during retrieval evaluation
                 cand_embed_dict = {
                     cand_id: embed for cand_id, embed in zip(all_cand_ids, cand_embeds)
                 }
                 with open(cand_embed_path, 'wb') as f:
                     pickle.dump(cand_embed_dict, f)
-                print_master(f"Successfully saved {len(cand_embed_dict)} unique candidate embeddings to {cand_embed_path}")
+                logger.info(f"  Candidate encoding done: {len(cand_embed_dict)} unique embeddings in {time.time() - t_enc:.1f}s "
+                            f"-> {cand_embed_path}")
 
             if dist.is_initialized():
                 dist.barrier()
@@ -275,7 +338,7 @@ def main():
         if rank == 0:
             score_path = os.path.join(data_args.encode_output_path, f"{dataset_name}_score.json")
             pred_path = os.path.join(data_args.encode_output_path, f"{dataset_name}_pred.jsonl")
-            
+
             # Skip computation only if both files exist and are valid
             need_compute = True
             if os.path.exists(score_path) and os.path.exists(pred_path):
@@ -283,105 +346,120 @@ def main():
                     with open(score_path, "r") as f:
                         score_dict = json.load(f)
                     if "num_pred" in score_dict:
-                        print_master(f"Results already exist for {dataset_name}. Skipping computation.")
-                        formatted = {k: f"{v:.4f}" for k, v in score_dict.items() if isinstance(v, (int, float))}
-                        print_master(f"Scores: {formatted}")
+                        logger.info(f"  Scores cached, skipping computation.")
                         need_compute = False
                 except Exception as e:
-                    print_master(f"Cache for {dataset_name} is corrupted ({e}), re-computing...")
+                    logger.warning(f"  Score cache corrupted ({e}), re-computing...")
 
             if need_compute:
+                logger.info(f"  Computing similarity scores...")
+                t_score = time.time()
+
                 # Load persisted embeddings and metadata
                 with open(query_embed_path, 'rb') as f:
                     qry_embeds = pickle.load(f)  # np.ndarray [Nq, D]
                 with open(cand_embed_path, 'rb') as f:
                     cand_embed_dict = pickle.load(f)  # Dict {id: [D]}
-                # Explicitly specify UTF-8 encoding to handle non-ASCII characters in dataset metadata
                 gt_infos = [json.loads(l) for l in open(dataset_info_path, encoding='utf-8')]
-                
+
+                logger.info(f"  Loaded: {len(qry_embeds)} query embeds (dim={qry_embeds.shape[1]}), "
+                            f"{len(cand_embed_dict)} candidate embeds")
+
                 device = model.device
                 pred_dicts = []
-                
-                # Convert to tensors and compute on GPU for acceleration
                 qry_tensor = torch.from_numpy(qry_embeds).to(device)
-                
+
                 rank_against_all_candidates = task_config.get("eval_type", "global") == "global"
                 if rank_against_all_candidates:
-                    # Global retrieval
+                    logger.info(f"  Ranking mode: GLOBAL (each query ranked against all {len(cand_embed_dict)} candidates)")
                     cand_keys = list(cand_embed_dict.keys())
                     cand_embeds = np.stack([cand_embed_dict[key] for key in cand_keys])
                     cand_tensor = torch.from_numpy(cand_embeds).to(device)
-                    
+
                     with torch.no_grad():
-                        # Compute similarity matrix [Nq, Nc] using model's matmul
                         scores = model.compute_similarity(qry_tensor, cand_tensor)
-                        # Get ranked indices (descending order)
                         _, ranked_indices = torch.sort(scores, dim=1, descending=True)
-                        ranked_indices = ranked_indices.cpu().float().numpy()
-                    
+                        ranked_indices = ranked_indices.cpu().numpy().astype(int)
+
                     del cand_tensor
                     torch.cuda.empty_cache()
 
                     for qid, (ranked_idx, gt_info) in tqdm(
-                        enumerate(zip(ranked_indices, gt_infos)), 
+                        enumerate(zip(ranked_indices, gt_infos)),
                         total=len(gt_infos), desc=f"Global Ranking: {dataset_name}",
                         disable=local_rank > 0, ncols=120,
                     ):
                         rel_docids = gt_info["label_name"] if isinstance(gt_info["label_name"], list) else [gt_info["label_name"]]
                         rel_scores = gt_info.get("rel_scores", None)
-                        
                         pred_dicts.append({
-                            "prediction": [cand_keys[i] for i in ranked_idx],  # Save complete ranking
+                            "prediction": [cand_keys[i] for i in ranked_idx],
                             "label": rel_docids,
                             "rel_scores": rel_scores,
                         })
                 else:
-                    # Local ranking (in-batch or per-query set)
+                    logger.info(f"  Ranking mode: LOCAL (per-query candidate set)")
                     for qid, (qry_vec, gt_info) in tqdm(
-                        enumerate(zip(qry_tensor, gt_infos)), 
+                        enumerate(zip(qry_tensor, gt_infos)),
                         total=len(gt_infos), desc=f"Local Ranking: {dataset_name}",
                         disable=local_rank > 0, ncols=120
                     ):
                         cand_names = gt_info["cand_names"]
                         cand_embeds = np.stack([cand_embed_dict[name] for name in cand_names])
                         cand_tensor = torch.from_numpy(cand_embeds).to(device)
-                        
+
                         with torch.no_grad():
-                            # Compute single-row similarity [1, Nc]
                             sim_scores = model.compute_similarity(qry_vec.unsqueeze(0), cand_tensor).squeeze(0)
                             _, ranked_idx = torch.sort(sim_scores, descending=True)
-                            ranked_idx = ranked_idx.cpu().float().numpy()
+                            ranked_idx = ranked_idx.cpu().numpy().astype(int)
 
                         rel_docids = gt_info["label_name"] if isinstance(gt_info["label_name"], list) else [gt_info["label_name"]]
                         rel_scores = gt_info.get("rel_scores", None)
-
                         pred_dicts.append({
                             "prediction": [cand_names[i] for i in ranked_idx],
                             "label": rel_docids,
                             "rel_scores": rel_scores,
                         })
-                    
+
                     torch.cuda.empty_cache()
 
                 # Compute metrics
                 metrics_to_report = task_config.get("metrics", ["hit", "ndcg", "precision", "recall", "f1", "map", "mrr"])
                 metrics = RankingMetrics(metrics_to_report)
                 score_dict = metrics.evaluate(pred_dicts)
-                
+
                 score_dict["num_pred"] = len(pred_dicts)
                 score_dict["num_data"] = len(gt_infos)
-                
-                # Persist results
+
                 with open(score_path, "w") as f:
                     json.dump(score_dict, f, indent=4)
-                
-                # Save predictions in JSONL format (complete candidate ranking)
                 with open(pred_path, "w", encoding='utf-8') as f:
                     for pred in pred_dicts:
                         f.write(json.dumps(pred, ensure_ascii=False) + '\n')
-                
-                formatted = {k: f"{v:.4f}" for k, v in score_dict.items() if isinstance(v, (int, float))}
-                print_master(f"Final Score for {dataset_name}: {formatted}")
+
+                logger.info(f"  Scoring done in {time.time() - t_score:.1f}s")
+
+            # Log results (both cached and freshly computed)
+            with open(score_path, "r") as f:
+                score_dict = json.load(f)
+
+            logger.info(f"")
+            logger.info(f"  Results for {dataset_name}:")
+            logger.info(f"  {'─' * 40}")
+            key_metrics = ['hit@1', 'hit@5', 'hit@10', 'mrr@10', 'ndcg_linear@10', 'map@10']
+            for k in key_metrics:
+                if k in score_dict:
+                    logger.info(f"    {k:<25s} {score_dict[k]:.4f}")
+            logger.info(f"  {'─' * 40}")
+            logger.info(f"    {'num_queries':<25s} {score_dict.get('num_data', 'N/A')}")
+            logger.info(f"    {'num_predictions':<25s} {score_dict.get('num_pred', 'N/A')}")
+            logger.info(f"  Score file: {score_path}")
+            logger.info(f"  Pred file:  {pred_path}")
+            logger.info(f"  Dataset total time: {time.time() - dataset_t0:.1f}s")
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("Evaluation complete.")
+    logger.info("=" * 60)
 
     if dist.is_initialized():
         dist.barrier()
